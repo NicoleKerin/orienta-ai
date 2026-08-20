@@ -8,7 +8,7 @@ import time
 CHUNKS_FILE = "chunks.json"
 COLLECTION_NAME = "orientai"
 EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"  # mesmo modelo multilingue de antes
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 def main():
@@ -80,11 +80,7 @@ def main():
     if ChunkingStrategy is None or Document is None or TextReader is None:
         diagnostico_e_sai()
 
-    # ------------------------------------------------------------
-    # Estrategia de chunking customizada: em vez de deixar o Agno
-    # cortar o texto do zero, so devolve os chunks que ja estao no
-    # chunks.json (gerados pelo chunk_markdown.py corrigido).
-    # ------------------------------------------------------------
+
     class ChunksProntosDoOrientAI(ChunkingStrategy):
         def chunk(self, document: Document) -> list:
             with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
@@ -107,7 +103,8 @@ def main():
         vector_db=ChromaDb(
             collection=COLLECTION_NAME,
             embedder=SentenceTransformerEmbedder(id=EMBEDDING_MODEL),
-            path="./chroma_db",  # fica salvo localmente nessa pasta
+            path="./chroma_db",  # fica salvo localmente nessa pasta,
+            persistent_client=True,
         ),
     )
 
@@ -119,11 +116,14 @@ def main():
     reader = TextReader(chunking_strategy=ChunksProntosDoOrientAI())
 
     print("Gerando embeddings e indexando no Chroma (pode demorar na primeira vez)...")
-    knowledge.add_content(
-        name="Documentos do IFSC",
-        path=CHUNKS_FILE,
-        reader=reader,
-    )
+
+    INGESTED_FLAG = "./data/.ingested"
+    if not os.path.exists(INGESTED_FLAG):
+        knowledge.add_content(
+            name="Documentos do IFSC",
+            path=CHUNKS_FILE,
+            reader=reader,
+        )
 
     agent = Agent(
         model=Groq(id=GROQ_MODEL),
