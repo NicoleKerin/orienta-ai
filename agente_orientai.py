@@ -1,5 +1,4 @@
 
-
 import json
 import os
 import sys
@@ -8,8 +7,7 @@ import time
 CHUNKS_FILE = "chunks.json"
 COLLECTION_NAME = "orientai"
 EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"  # mesmo modelo multilingue de antes
-GROQ_MODEL = "llama-3.1-8b-instant"
-
+GROQ_MODEL = "qwen/qwen3.6-27b"
 
 def main():
     if not os.environ.get("GROQ_API_KEY"):
@@ -99,13 +97,14 @@ def main():
             ]
 
     print("Configurando a base de conhecimento (embeddings + Chroma)...")
+
     knowledge = Knowledge(
         vector_db=ChromaDb(
             collection=COLLECTION_NAME,
             embedder=SentenceTransformerEmbedder(id=EMBEDDING_MODEL),
             path="./chroma_db",  # fica salvo localmente nessa pasta,
             persistent_client=True,
-        ),
+        )
     )
 
     # Nessa versao do agno, a chunking_strategy vai no Reader, nao
@@ -124,12 +123,14 @@ def main():
             path=CHUNKS_FILE,
             reader=reader,
         )
+        open(INGESTED_FLAG, 'w').close()
 
     agent = Agent(
         model=Groq(id=GROQ_MODEL),
         knowledge=knowledge,
         search_knowledge=True,
         instructions=[
+            "Faça apenas UMA busca na base de conhecimento por vez.",
             "Você é um assistente que responde perguntas com base nos documentos institucionais do IFSC.",
             "Responda sempre em português, de forma clara e objetiva.",
             "Baseie suas respostas apenas no conteúdo recuperado da base de conhecimento.",
