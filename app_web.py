@@ -128,8 +128,8 @@ def montar_agente():
 
 MENSAGEM_BOAS_VINDAS = (
     "Oi! Eu sou o **OrientAI** 🎓, o assistente virtual dos estudantes do IFSC.\n\n"
-    "Posso te ajudar com dúvidas sobre o Código de Convivência Discente e outros documentos "
-    "institucionais - direitos, deveres, o que pode e o que não pode, medidas disciplinares, "
+    "Posso te ajudar com dúvidas sobre a instituição"
+    " - direitos, deveres, o que pode e o que não pode, medidas disciplinares, "
     "bolsas e mais.\n\n"
     "Manda sua pergunta aí embaixo!"
 )
@@ -212,6 +212,7 @@ for msg in st.session_state.mensagens:
         st.markdown(msg["content"])
 
 pergunta = st.chat_input("Digite sua pergunta sobre os documentos do IFSC...")
+pergunta = "Como posso contatar os professores?"
 
 if pergunta:
     st.session_state.mensagens.append({"role": "user", "content": pergunta})
