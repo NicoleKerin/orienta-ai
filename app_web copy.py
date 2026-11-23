@@ -1,3 +1,4 @@
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -15,8 +16,13 @@ CHUNKS_FILE = "chunks.json"
 DB_PATH = "./chroma_db"
 COLLECTION_NAME = "orientai"
 EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
-GEMINI_MODEL = "gemini-3.5-flash"
-MAX_TENTATIVAS = 3
+
+# Lista de modelos gratuitos do Gemini em ordem de prioridade (maior cota diaria primeiro)
+GEMINI_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+]
 
 
 def find_class(candidates, class_name):
@@ -35,23 +41,20 @@ def calcular_hash_arquivo(caminho):
 
 
 @st.cache_resource(show_spinner="Carregando base de conhecimento do OrientAI...")
-def montar_agente():
-    from agno.agent import Agent
-
+def montar_base_conhecimento():
     Knowledge = find_class(["agno.knowledge.knowledge", "agno.knowledge"], "Knowledge")
     ChromaDb = find_class(["agno.vectordb.chroma", "agno.vectordb.chroma.chroma_db"], "ChromaDb")
     SentenceTransformerEmbedder = find_class(
         ["agno.embedder.sentence_transformer", "agno.knowledge.embedder.sentence_transformer"],
         "SentenceTransformerEmbedder",
     )
-    Gemini = find_class(["agno.models.google", "agno.models.google.gemini"], "Gemini")
     ChunkingStrategy = find_class(
         ["agno.knowledge.chunking.base", "agno.knowledge.chunking.strategy"], "ChunkingStrategy"
     )
     Document = find_class(["agno.knowledge.document", "agno.knowledge.document.base"], "Document")
     TextReader = find_class(["agno.knowledge.reader.text_reader"], "TextReader")
 
-    if not all([Knowledge, ChromaDb, SentenceTransformerEmbedder, Gemini, ChunkingStrategy, Document, TextReader]):
+    if not all([Knowledge, ChromaDb, SentenceTransformerEmbedder, ChunkingStrategy, Document, TextReader]):
         st.error("Nao consegui importar as classes do agno. Verifique a instalacao.")
         st.stop()
 
@@ -103,15 +106,25 @@ def montar_agente():
         with open(hash_file, "w", encoding="utf-8") as f:
             f.write(hash_atual)
 
+    return knowledge
+
+
+def criar_agente_com_modelo(knowledge, model_id):
+    from agno.agent import Agent
+
+    Gemini = find_class(["agno.models.google", "agno.models.google.gemini"], "Gemini")
+    data_hoje = datetime.now().strftime("%d/%m/%Y")
+
     return Agent(
-        model=Gemini(id=GEMINI_MODEL),
+        model=Gemini(id=model_id),
         knowledge=knowledge,
         search_knowledge=True,
         instructions=[
+            f"Data atual: {data_hoje}. Use essa data como referencia para calcular prazos, anos ou idade da instituicao.",
             "Voce e o OrientAI, assistente virtual dos estudantes do IFSC.",
             "Tom: amigavel, acolhedor e direto — como um veterano ajudando um calouro, sem ser formal demais.",
-            "REGRA DE SAUDAÇÃO: Voce JA se apresentou na mensagem inicial do chat. NUNCA diga 'Oi, eu sou o OrientAI' ou se apresente novamente. Va direto ao ponto da resposta.",
-            "FOCO E ESCOPO: Baseie suas respostas EXCLUSIVAMENTE nos documentos recuperados da base de conhecimento do IFSC. Se perguntarem algo pessoal (ex: 'o que voce gosta de fazer') ou fora dos documentos, responda em 1 frase curta e amigavel que seu foco e ajudar com as regras e documentos do IFSC, sem inventar funcoes que nao tem.",
+            "REGRA DE SAUDACAO: Voce JA se apresentou na mensagem inicial do chat. NUNCA diga 'Oi, eu sou o OrientAI' ou se apresente novamente. Va direto ao ponto da resposta.",
+            "FOCO E ESCOPO: Baseie suas respostas EXCLUSIVAMENTE nos documentos recuperados da base de conhecimento do IFSC. Se perguntarem algo pessoal ou fora dos documentos, responda em 1 frase curta e amigavel que seu foco e ajudar com as regras e documentos do IFSC, sem inventar funcoes que nao tem.",
             "Se a informacao nao estiver nos documentos, diga isso claramente de forma simpatica, sem inventar.",
             "Quando encontrar a resposta nos documentos, cite o documento, capitulo ou artigo correspondente.",
             "Use o historico da conversa fornecido para manter o contexto e responder perguntas sobre mensagens anteriores.",
@@ -129,7 +142,6 @@ MENSAGEM_BOAS_VINDAS = (
 
 
 def formatar_historico(mensagens, limite=10):
-    """Monta um resumo das ultimas mensagens para o agente ter memoria real da conversa."""
     recentes = mensagens[-limite:]
     linhas = []
     for m in recentes:
@@ -138,23 +150,39 @@ def formatar_historico(mensagens, limite=10):
     return "\n".join(linhas)
 
 
-def responder_com_retry(agent, historico_mensagens, pergunta_atual):
+def _parece_erro(texto):
+    if not texto:
+        return True
+    marcadores = ('"error"', "RESOURCE_EXHAUSTED", "quota", "429", "invalid_request_error")
+    return any(m in texto for m in marcadores)
+
+
+def responder_com_fallback(knowledge, historico_mensagens, pergunta_atual):
     contexto_conversa = formatar_historico(historico_mensagens[:-1], limite=10)
     prompt_completo = (
         f"Histórico recente desta conversa:\n{contexto_conversa}\n\n"
         f"Nova mensagem do estudante: {pergunta_atual}"
     )
 
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    for model_id in GEMINI_MODELS:
         try:
+            agent = criar_agente_com_modelo(knowledge, model_id)
             resposta = agent.run(prompt_completo)
-            if resposta and resposta.content:
-                return resposta.content
+            texto = resposta.content if resposta else ""
+
+            if _parece_erro(texto):
+                print(f"[Fallback] Modelo {model_id} atingiu cota/erro silencioso. Tentando proximo...")
+                continue
+
+            return texto
         except Exception as e:
-            print(f"[Tentativa {tentativa}] Erro: {e}")
-            if tentativa < MAX_TENTATIVAS:
-                time.sleep(1.5)
-    return "Tive uma falha temporaria pra buscar essa informacao. Tenta perguntar de novo em alguns segundos."
+            print(f"[Fallback] Modelo {model_id} falhou ({e}). Tentando proximo...")
+            time.sleep(1)
+
+    return (
+        "Atingi o limite gratuito diário de consultas por hoje 😅. "
+        "Tenta novamente mais tarde ou amanhã!"
+    )
 
 
 st.set_page_config(page_title="OrientAI", page_icon="🎓", layout="centered")
@@ -169,7 +197,7 @@ if not os.path.exists(CHUNKS_FILE):
     st.error(f"Arquivo '{CHUNKS_FILE}' nao encontrado nessa pasta.")
     st.stop()
 
-agent = montar_agente()
+knowledge = montar_base_conhecimento()
 
 if "mensagens" not in st.session_state:
     st.session_state.mensagens = [{"role": "assistant", "content": MENSAGEM_BOAS_VINDAS}]
@@ -187,7 +215,7 @@ if pergunta:
 
     with st.chat_message("assistant"):
         with st.spinner("Buscando nos documentos..."):
-            resposta = responder_com_retry(agent, st.session_state.mensagens, pergunta)
+            resposta = responder_com_fallback(knowledge, st.session_state.mensagens, pergunta)
         st.markdown(resposta)
 
     st.session_state.mensagens.append({"role": "assistant", "content": resposta})
