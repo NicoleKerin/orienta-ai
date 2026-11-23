@@ -17,10 +17,10 @@ DB_PATH = "./chroma_db"
 COLLECTION_NAME = "orientai"
 EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 
-# Lista de modelos gratuitos do Gemini em ordem de prioridade (maior cota diaria primeiro)
+# Lista de modelos do Gemini em ordem de prioridade (mais leve/estavel primeiro)
 GEMINI_MODELS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
-   "gemini-3.5-flash-lite",
 ]
 
 
@@ -108,7 +108,35 @@ def montar_base_conhecimento():
     return knowledge
 
 
-def criar_agente_com_modelo(knowledge, model_id):
+def buscar_contexto(knowledge, pergunta, limite=5):
+    try:
+        if hasattr(knowledge, "search"):
+            docs = knowledge.search(query=pergunta, max_results=limite)
+        elif hasattr(knowledge, "vector_db") and hasattr(knowledge.vector_db, "search"):
+            docs = knowledge.vector_db.search(query=pergunta, limit=limite)
+        else:
+            docs = []
+
+        docs = docs or []
+        print(f"[DEBUG BUSCA] Encontrados: {len(docs)} documentos para '{pergunta}'")
+        if not docs:
+            return ""
+
+        trechos = []
+        for i, d in enumerate(docs, 1):
+            meta = getattr(d, "meta_data", None) or {}
+            fonte = meta.get("source_file", "Documento IFSC")
+            secao = meta.get("header_path", "")
+            conteudo = getattr(d, "content", "")
+            trechos.append(f"[Trecho {i} | Fonte: {fonte} | Seção: {secao}]\n{conteudo}")
+
+        return "\n\n---\n\n".join(trechos)
+    except Exception as e:
+        print(f"[DEBUG BUSCA] Erro na busca: {e}")
+        return ""
+
+
+def criar_agente_com_modelo(model_id):
     from agno.agent import Agent
 
     Gemini = find_class(["agno.models.google", "agno.models.google.gemini"], "Gemini")
@@ -116,16 +144,14 @@ def criar_agente_com_modelo(knowledge, model_id):
 
     return Agent(
         model=Gemini(id=model_id),
-        knowledge=knowledge,
-        search_knowledge=True,
         instructions=[
             f"Data atual: {data_hoje}. Use essa data como referencia para calcular prazos, anos ou idade da instituicao.",
             "Voce e o OrientAI, assistente virtual dos estudantes do IFSC.",
             "Tom: amigavel, acolhedor e direto — como um veterano ajudando um calouro, sem ser formal demais.",
             "REGRA DE SAUDACAO: Voce JA se apresentou na mensagem inicial do chat. NUNCA diga 'Oi, eu sou o OrientAI' ou se apresente novamente. Va direto ao ponto da resposta.",
-            "FOCO E ESCOPO: Baseie suas respostas EXCLUSIVAMENTE nos documentos recuperados da base de conhecimento do IFSC. Se perguntarem algo pessoal ou fora dos documentos, responda em 1 frase curta e amigavel que seu foco e ajudar com as regras e documentos do IFSC, sem inventar funcoes que nao tem.",
-            "Se a informacao nao estiver nos documentos, diga isso claramente de forma simpatica, sem inventar.",
-            "Quando encontrar a resposta nos documentos, cite o documento, capitulo ou artigo correspondente.",
+            "FOCO E ESCOPO: Baseie suas respostas EXCLUSIVAMENTE nos trechos de documentos fornecidos no prompt. Se perguntarem algo pessoal ou fora dos documentos, responda em 1 frase curta e amigavel que seu foco e ajudar com as regras e documentos do IFSC, sem inventar funcoes que nao tem.",
+            "Se a informacao nao estiver nos trechos fornecidos, diga isso claramente de forma simpatica, sem inventar.",
+            "Quando encontrar a resposta nos trechos, cite o documento, capitulo ou artigo correspondente.",
             "Use o historico da conversa fornecido para manter o contexto e responder perguntas sobre mensagens anteriores.",
         ],
     )
@@ -152,35 +178,50 @@ def formatar_historico(mensagens, limite=10):
 def _parece_erro(texto):
     if not texto:
         return True
-    marcadores = ('"error"', "RESOURCE_EXHAUSTED", "quota", "429", "invalid_request_error")
+    marcadores = (
+        '"error"',
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "503",
+        "429",
+        "quota",
+        "invalid_request_error",
+        "Error from Gemini API",
+    )
     return any(m in texto for m in marcadores)
 
 
 def responder_com_fallback(knowledge, historico_mensagens, pergunta_atual):
-    contexto_conversa = formatar_historico(historico_mensagens[:-1], limite=10)
+    contexto_conversa = formatar_historico(historico_mensagens[:-1], limite=6)
+    trechos_docs = buscar_contexto(knowledge, pergunta_atual, limite=5)
+
     prompt_completo = (
+        f"Trechos recuperados dos documentos oficiais do IFSC:\n"
+        f"{trechos_docs if trechos_docs else 'Nenhum trecho encontrado na base.'}\n\n"
         f"Histórico recente desta conversa:\n{contexto_conversa}\n\n"
         f"Nova mensagem do estudante: {pergunta_atual}"
     )
 
     for model_id in GEMINI_MODELS:
-        try:
-            agent = criar_agente_com_modelo(knowledge, model_id)
-            resposta = agent.run(prompt_completo)
-            texto = resposta.content if resposta else ""
+        for tentativa in range(2):
+            try:
+                agent = criar_agente_com_modelo(model_id)
+                resposta = agent.run(prompt_completo)
+                texto = resposta.content if resposta else ""
 
-            if _parece_erro(texto):
-                print(f"[Fallback] Modelo {model_id} atingiu cota/erro silencioso. Tentando proximo...")
-                continue
+                if _parece_erro(texto):
+                    print(f"[Fallback] {model_id} (tentativa {tentativa+1}) retornou erro. Aguardando...")
+                    time.sleep(2)
+                    continue
 
-            return texto
-        except Exception as e:
-            print(f"[Fallback] Modelo {model_id} falhou ({e}). Tentando proximo...")
-            time.sleep(1)
+                return texto
+            except Exception as e:
+                print(f"[Fallback] {model_id} (tentativa {tentativa+1}) falhou: {e}")
+                time.sleep(2)
 
     return (
-        "Atingi o limite gratuito diário de consultas por hoje 😅. "
-        "Tenta novamente mais tarde ou amanhã!"
+        "Os servidores do Gemini estão com instabilidade temporária ou atingiram o limite gratuito agora 😅. "
+        "Tenta novamente em alguns segundos!"
     )
 
 
