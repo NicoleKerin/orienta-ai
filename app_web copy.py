@@ -119,6 +119,16 @@ def buscar_contexto(knowledge, pergunta, limite=5):
 
         docs = docs or []
         print(f"[DEBUG BUSCA] Encontrados: {len(docs)} documentos para '{pergunta}'")
+        
+       if not docs and hasattr(knowledge, "vector_db"):
+            vdb = knowledge.vector_db
+            print("[DEBUG VDB] attrs:", [a for a in dir(vdb) if not a.startswith("_")])
+            if hasattr(vdb, "client"):
+                try:
+                    print("[DEBUG VDB] collections:", [c.name for c in vdb.client.list_collections()])
+                except Exception as e:
+                    print("[DEBUG VDB] erro list_collections:", e)
+
         if not docs:
             return ""
 
