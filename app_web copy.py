@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -103,13 +104,12 @@ def montar_agente():
         with open(hash_file, "w", encoding="utf-8") as f:
             f.write(hash_atual)
 
-    return Agent(
-        model=Gemini(id=GEMINI_MODEL),
-        knowledge=knowledge,
-        search_knowledge=True,
-        add_history_to_messages=True,
-        num_history_responses=4,
-        instructions=[
+    sig = inspect.signature(Agent.__init__).parameters
+    agent_kwargs = {
+        "model": Gemini(id=GEMINI_MODEL),
+        "knowledge": knowledge,
+        "search_knowledge": True,
+        "instructions": [
             "Voce se chama OrientAI, um assistente virtual dos estudantes do IFSC.",
             "Seu tom e amigavel, acolhedor e direto - como um veterano ajudando um calouro, nunca formal ou burocratico demais.",
             "Responda sempre em portugues, de forma clara e objetiva.",
@@ -118,7 +118,18 @@ def montar_agente():
             "Quando fizer sentido, cite de qual documento ou capitulo veio a informacao.",
             "Nao repita sua apresentacao a cada resposta - apresente-se so uma vez, no inicio da conversa.",
         ],
-    )
+    }
+
+    if "add_history_to_context" in sig:
+        agent_kwargs["add_history_to_context"] = True
+        if "num_history_runs" in sig:
+            agent_kwargs["num_history_runs"] = 4
+    elif "add_history_to_messages" in sig:
+        agent_kwargs["add_history_to_messages"] = True
+        if "num_history_responses" in sig:
+            agent_kwargs["num_history_responses"] = 4
+
+    return Agent(**agent_kwargs)
 
 
 MENSAGEM_BOAS_VINDAS = (
