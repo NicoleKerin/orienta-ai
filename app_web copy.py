@@ -19,9 +19,8 @@ EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 
 # Lista de modelos gratuitos do Gemini em ordem de prioridade (maior cota diaria primeiro)
 GEMINI_MODELS = [
-   "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+   "gemini-3.5-flash-lite",
 ]
 
 
