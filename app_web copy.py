@@ -119,8 +119,8 @@ def buscar_contexto(knowledge, pergunta, limite=5):
 
         docs = docs or []
         print(f"[DEBUG BUSCA] Encontrados: {len(docs)} documentos para '{pergunta}'")
-        
-       if not docs and hasattr(knowledge, "vector_db"):
+
+        if not docs and hasattr(knowledge, "vector_db"):
             vdb = knowledge.vector_db
             print("[DEBUG VDB] attrs:", [a for a in dir(vdb) if not a.startswith("_")])
             if hasattr(vdb, "client"):
@@ -131,6 +131,19 @@ def buscar_contexto(knowledge, pergunta, limite=5):
 
         if not docs:
             return ""
+
+        trechos = []
+        for i, d in enumerate(docs, 1):
+            meta = getattr(d, "meta_data", None) or {}
+            fonte = meta.get("source_file", "Documento IFSC")
+            secao = meta.get("header_path", "")
+            conteudo = getattr(d, "content", "")
+            trechos.append(f"[Trecho {i} | Fonte: {fonte} | Seção: {secao}]\n{conteudo}")
+
+        return "\n\n---\n\n".join(trechos)
+    except Exception as e:
+        print(f"[DEBUG BUSCA] Erro na busca: {e}")
+        return ""
 
         trechos = []
         for i, d in enumerate(docs, 1):
