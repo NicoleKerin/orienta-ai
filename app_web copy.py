@@ -1,5 +1,4 @@
 import hashlib
-import inspect
 import json
 import os
 import shutil
@@ -104,47 +103,51 @@ def montar_agente():
         with open(hash_file, "w", encoding="utf-8") as f:
             f.write(hash_atual)
 
-    sig = inspect.signature(Agent.__init__).parameters
-    agent_kwargs = {
-        "model": Gemini(id=GEMINI_MODEL),
-        "knowledge": knowledge,
-        "search_knowledge": True,
-        "instructions": [
-            "Voce se chama OrientAI, um assistente virtual dos estudantes do IFSC.",
-            "Seu tom e amigavel, acolhedor e direto - como um veterano ajudando um calouro, nunca formal ou burocratico demais.",
-            "Responda sempre em portugues, de forma clara e objetiva.",
-            "Baseie suas respostas apenas no conteudo recuperado da base de conhecimento.",
-            "Se a informacao nao estiver nos documentos, diga isso claramente e de forma simpatica, em vez de inventar.",
-            "Quando fizer sentido, cite de qual documento ou capitulo veio a informacao.",
-            "Nao repita sua apresentacao a cada resposta - apresente-se so uma vez, no inicio da conversa.",
+    return Agent(
+        model=Gemini(id=GEMINI_MODEL),
+        knowledge=knowledge,
+        search_knowledge=True,
+        instructions=[
+            "Voce e o OrientAI, assistente virtual dos estudantes do IFSC.",
+            "Tom: amigavel, acolhedor e direto — como um veterano ajudando um calouro, sem ser formal demais.",
+            "REGRA DE SAUDAÇÃO: Voce JA se apresentou na mensagem inicial do chat. NUNCA diga 'Oi, eu sou o OrientAI' ou se apresente novamente. Va direto ao ponto da resposta.",
+            "FOCO E ESCOPO: Baseie suas respostas EXCLUSIVAMENTE nos documentos recuperados da base de conhecimento do IFSC. Se perguntarem algo pessoal (ex: 'o que voce gosta de fazer') ou fora dos documentos, responda em 1 frase curta e amigavel que seu foco e ajudar com as regras e documentos do IFSC, sem inventar funcoes que nao tem.",
+            "Se a informacao nao estiver nos documentos, diga isso claramente de forma simpatica, sem inventar.",
+            "Quando encontrar a resposta nos documentos, cite o documento, capitulo ou artigo correspondente.",
+            "Use o historico da conversa fornecido para manter o contexto e responder perguntas sobre mensagens anteriores.",
         ],
-    }
-
-    if "add_history_to_context" in sig:
-        agent_kwargs["add_history_to_context"] = True
-        if "num_history_runs" in sig:
-            agent_kwargs["num_history_runs"] = 4
-    elif "add_history_to_messages" in sig:
-        agent_kwargs["add_history_to_messages"] = True
-        if "num_history_responses" in sig:
-            agent_kwargs["num_history_responses"] = 4
-
-    return Agent(**agent_kwargs)
+    )
 
 
 MENSAGEM_BOAS_VINDAS = (
     "Oi! Eu sou o **OrientAI** 🎓, o assistente virtual dos estudantes do IFSC.\n\n"
     "Posso te ajudar com dúvidas sobre o Código de Convivência Discente e outros documentos "
-    "institucionais - direitos, deveres, o que pode e o que não pode, medidas disciplinares, "
+    "institucionais — direitos, deveres, o que pode e o que não pode, medidas disciplinares, "
     "bolsas e mais.\n\n"
     "Manda sua pergunta aí embaixo!"
 )
 
 
-def responder_com_retry(agent, pergunta):
+def formatar_historico(mensagens, limite=10):
+    """Monta um resumo das ultimas mensagens para o agente ter memoria real da conversa."""
+    recentes = mensagens[-limite:]
+    linhas = []
+    for m in recentes:
+        papel = "Estudante" if m["role"] == "user" else "OrientAI"
+        linhas.append(f"{papel}: {m['content']}")
+    return "\n".join(linhas)
+
+
+def responder_com_retry(agent, historico_mensagens, pergunta_atual):
+    contexto_conversa = formatar_historico(historico_mensagens[:-1], limite=10)
+    prompt_completo = (
+        f"Histórico recente desta conversa:\n{contexto_conversa}\n\n"
+        f"Nova mensagem do estudante: {pergunta_atual}"
+    )
+
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            resposta = agent.run(pergunta)
+            resposta = agent.run(prompt_completo)
             if resposta and resposta.content:
                 return resposta.content
         except Exception as e:
@@ -184,7 +187,7 @@ if pergunta:
 
     with st.chat_message("assistant"):
         with st.spinner("Buscando nos documentos..."):
-            resposta = responder_com_retry(agent, pergunta)
+            resposta = responder_com_retry(agent, st.session_state.mensagens, pergunta)
         st.markdown(resposta)
 
     st.session_state.mensagens.append({"role": "assistant", "content": resposta})
