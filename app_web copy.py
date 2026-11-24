@@ -1,28 +1,38 @@
-from contextlib import contextmanager
-from datetime import datetime
 import hashlib
+import inspect
 import json
+import logging
 import os
 import shutil
 import time
+from contextlib import contextmanager
+from datetime import datetime
+from itertools import zip_longest
 
-# Evita checar internet no Hugging Face se o modelo já foi baixado antes
-if os.path.exists(os.path.expanduser("~/.cache/huggingface/hub")):
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-import streamlit as st
-
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
 CHUNKS_FILE = "chunks.json"
 DB_PATH = "./chroma_db"
-LOCK_FILE = os.path.join(DB_PATH, ".indexing.lock")
+LOCK_FILE = "./chroma_db.indexing.lock"  # fora do DB_PATH, para poder apagar o banco inteiro
 HASH_FILE = os.path.join(DB_PATH, "chunks.sha256")
 COLLECTION_NAME = "orientai"
 EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 
+LOCK_TIMEOUT = 180            # quanto tempo esperar outro processo terminar de indexar
+LOCK_STALE_SECONDS = 15 * 60  # lock mais velho que isso é considerado "órfão" (app caiu)
+TAMANHO_LOTE_INDEXACAO = 64
+MAX_TENTATIVAS_POR_MODELO = 2
+
+# Pode ser sobrescrito sem mexer no código:
+#   $env:ORIENTAI_GEMINI_MODELS="gemini-2.5-flash,gemini-2.5-flash-lite"
+# CONFIRME esses IDs na documentação do Gemini; ID inválido = fallback sempre falha.
 GEMINI_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    m.strip()
+    for m in os.environ.get(
+        "ORIENTAI_GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash"
+    ).split(",")
+    if m.strip()
 ]
 
 MENSAGEM_BOAS_VINDAS = (
@@ -32,6 +42,37 @@ MENSAGEM_BOAS_VINDAS = (
     "bolsas e mais.\n\n"
     "Manda sua pergunta aí embaixo!"
 )
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("orientai")
+
+
+# ---------------------------------------------------------------------------
+# Modo offline do Hugging Face (só se ESTE modelo já estiver baixado)
+# ---------------------------------------------------------------------------
+def modelo_em_cache_hf(model_id):
+    nome = model_id if "/" in model_id else f"sentence-transformers/{model_id}"
+    hub = os.environ.get("HF_HUB_CACHE")
+    if not hub:
+        hf_home = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        hub = os.path.join(hf_home, "hub")
+    snapshots = os.path.join(hub, "models--" + nome.replace("/", "--"), "snapshots")
+    return os.path.isdir(snapshots) and bool(os.listdir(snapshots))
+
+
+# Precisa rodar antes de importar transformers/sentence-transformers
+if modelo_em_cache_hf(EMBEDDING_MODEL):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+import streamlit as st  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Utilitários
+# ---------------------------------------------------------------------------
+def obter_api_key():
+    return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
 
 def find_class(candidates, class_name):
@@ -45,8 +86,11 @@ def find_class(candidates, class_name):
 
 
 def calcular_hash_arquivo(caminho):
+    h = hashlib.sha256()
     with open(caminho, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+        for bloco in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(bloco)
+    return h.hexdigest()
 
 
 def carregar_chunks(caminho):
@@ -58,23 +102,51 @@ def carregar_chunks(caminho):
 
 
 @contextmanager
-def arquivo_lock(lock_path, timeout=60):
-    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-    inicio = time.time()
-    while os.path.exists(lock_path):
-        if time.time() - inicio > timeout:
-            raise TimeoutError(f"Tempo esgotado aguardando lock de indexação: {lock_path}")
-        time.sleep(0.25)
+def arquivo_lock(lock_path, timeout=LOCK_TIMEOUT, stale_after=LOCK_STALE_SECONDS):
+    """Lock atômico (O_EXCL) com recuperação de lock órfão por idade.
 
-    with open(lock_path, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+    Obs.: não checamos PID de propósito — os.kill(pid, 0) no Windows MATA o processo.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    inicio = time.time()
+    fd = None
+
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.time() - inicio > timeout:
+                raise TimeoutError(f"Tempo esgotado aguardando lock de indexação: {lock_path}")
+            try:
+                idade = time.time() - os.path.getmtime(lock_path)
+            except FileNotFoundError:
+                continue  # foi liberado agora; tenta pegar de novo
+            if idade > stale_after:
+                logger.warning("Lock órfão (%.0fs) removido: %s", idade, lock_path)
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    time.sleep(0.25)
+                continue
+            time.sleep(0.25)
+
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)  # no Windows não dá para remover arquivo com handle aberto
+
     try:
         yield
     finally:
-        if os.path.exists(lock_path):
+        try:
             os.remove(lock_path)
+        except FileNotFoundError:
+            pass
 
 
+# ---------------------------------------------------------------------------
+# Base de conhecimento (indexação direta, sem o TextReader)
+# ---------------------------------------------------------------------------
 def importar_componentes_agno():
     classes = {
         "Knowledge": find_class(["agno.knowledge.knowledge", "agno.knowledge"], "Knowledge"),
@@ -83,11 +155,7 @@ def importar_componentes_agno():
             ["agno.embedder.sentence_transformer", "agno.knowledge.embedder.sentence_transformer"],
             "SentenceTransformerEmbedder",
         ),
-        "ChunkingStrategy": find_class(
-            ["agno.knowledge.chunking.base", "agno.knowledge.chunking.strategy"], "ChunkingStrategy"
-        ),
         "Document": find_class(["agno.knowledge.document", "agno.knowledge.document.base"], "Document"),
-        "TextReader": find_class(["agno.knowledge.reader.text_reader"], "TextReader"),
     }
     faltando = [nome for nome, cls in classes.items() if cls is None]
     if faltando:
@@ -95,106 +163,164 @@ def importar_componentes_agno():
     return classes
 
 
+def construir_documentos(chunks, Document):
+    documentos = []
+    for idx, c in enumerate(chunks):
+        texto = c.get("text")
+        if not texto or not str(texto).strip():
+            logger.warning("Chunk %s sem texto; ignorado.", idx)
+            continue
+
+        fonte = c.get("source_file", "Documento IFSC")
+        chunk_id = c.get("id", idx)
+        header = c.get("header_path", [])
+        if isinstance(header, (list, tuple)):
+            header = " > ".join(str(h) for h in header)
+
+        documentos.append(
+            Document(
+                id=f"{fonte}::{chunk_id}::{idx}",  # id único: evita dedup indevido
+                name=fonte,
+                content=texto,
+                meta_data={
+                    "source_file": fonte,
+                    "header_path": header,
+                    "chunk_id": chunk_id,
+                },
+            )
+        )
+    return documentos
+
+
+def inserir_documentos(vector_db, documentos, content_hash):
+    """Insere direto no vector_db, adaptando-se à assinatura do insert da versão do Agno."""
+    if hasattr(vector_db, "exists") and hasattr(vector_db, "create"):
+        if not vector_db.exists():
+            vector_db.create()
+
+    params = inspect.signature(vector_db.insert).parameters
+    for i in range(0, len(documentos), TAMANHO_LOTE_INDEXACAO):
+        lote = documentos[i : i + TAMANHO_LOTE_INDEXACAO]
+        kwargs = {"documents": lote}
+        if "content_hash" in params:
+            kwargs["content_hash"] = content_hash
+        vector_db.insert(**kwargs)
+        logger.info("Indexados %d/%d chunks", min(i + TAMANHO_LOTE_INDEXACAO, len(documentos)), len(documentos))
+
+
+def ler_hash_salvo():
+    if not os.path.exists(HASH_FILE):
+        return None
+    with open(HASH_FILE, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
 @st.cache_resource(show_spinner="Carregando base de conhecimento do OrientAI...")
 def montar_base_conhecimento(chunks_path=CHUNKS_FILE):
     agno_cls = importar_componentes_agno()
-    ChunkingStrategy = agno_cls["ChunkingStrategy"]
     Document = agno_cls["Document"]
     Knowledge = agno_cls["Knowledge"]
     ChromaDb = agno_cls["ChromaDb"]
     SentenceTransformerEmbedder = agno_cls["SentenceTransformerEmbedder"]
-    TextReader = agno_cls["TextReader"]
 
     chunks_dados = carregar_chunks(chunks_path)
     hash_atual = calcular_hash_arquivo(chunks_path)
 
-    class ChunksProntosDoOrientAI(ChunkingStrategy):
-        def __init__(self, chunks):
-            super().__init__()
-            self._chunks = chunks
-
-        def chunk(self, document):
-            return [
-                Document(
-                    content=c["text"],
-                    meta_data={
-                        "source_file": c.get("source_file", "Documento IFSC"),
-                        "header_path": " > ".join(c.get("header_path", [])),
-                        "chunk_id": c.get("id", idx),
-                    },
-                )
-                for idx, c in enumerate(self._chunks)
-            ]
-
     with arquivo_lock(LOCK_FILE):
-        hash_salvo = None
-        if os.path.exists(HASH_FILE):
-            with open(HASH_FILE, "r", encoding="utf-8") as f:
-                hash_salvo = f.read().strip()
-
-        precisa_indexar = hash_atual != hash_salvo
+        precisa_indexar = hash_atual != ler_hash_salvo()
 
         if precisa_indexar and os.path.exists(DB_PATH):
-            for entry in os.listdir(DB_PATH):
-                alvo = os.path.join(DB_PATH, entry)
-                if alvo == LOCK_FILE:
-                    continue
-                if os.path.isdir(alvo):
-                    shutil.rmtree(alvo)
-                else:
-                    os.remove(alvo)
+            shutil.rmtree(DB_PATH)
+        os.makedirs(DB_PATH, exist_ok=True)
 
-        knowledge = Knowledge(
-            vector_db=ChromaDb(
-                collection=COLLECTION_NAME,
-                embedder=SentenceTransformerEmbedder(id=EMBEDDING_MODEL),
-                path=DB_PATH,
-            ),
+        vector_db = ChromaDb(
+            collection=COLLECTION_NAME,
+            embedder=SentenceTransformerEmbedder(id=EMBEDDING_MODEL),
+            path=DB_PATH,
         )
+        knowledge = Knowledge(vector_db=vector_db)
 
         if precisa_indexar:
-            reader = TextReader(chunking_strategy=ChunksProntosDoOrientAI(chunks_dados))
-            knowledge.add_content(
-                name="Documentos do IFSC",
-                path=chunks_path,
-                reader=reader,
-            )
-            os.makedirs(DB_PATH, exist_ok=True)
+            documentos = construir_documentos(chunks_dados, Document)
+            if not documentos:
+                raise ValueError(f"Nenhum chunk válido encontrado em '{chunks_path}'.")
+            inserir_documentos(vector_db, documentos, hash_atual)
+            # Só grava o hash depois de indexar com sucesso
             with open(HASH_FILE, "w", encoding="utf-8") as f:
                 f.write(hash_atual)
 
     return knowledge
 
 
-def buscar_contexto(knowledge, pergunta, limite=5):
+# ---------------------------------------------------------------------------
+# Busca
+# ---------------------------------------------------------------------------
+class ErroBusca(RuntimeError):
+    """Falha real na busca vetorial (diferente de 'nenhum resultado')."""
+
+
+def montar_queries_busca(historico_anterior, pergunta, palavras_curta=8):
+    """Perguntas curtas de seguimento ("e se eu reprovar?") perdem o contexto.
+
+    Nesses casos buscamos também com a pergunta anterior do estudante colada antes.
+    A pergunta original sempre vai sozinha também, caso seja um assunto novo.
+    """
+    queries = [pergunta]
+    if len(pergunta.split()) <= palavras_curta:
+        anteriores = [m["content"] for m in historico_anterior if m["role"] == "user"]
+        if anteriores:
+            queries.append(f"{anteriores[-1]} {pergunta}")
+    return queries
+
+
+def _buscar_docs(knowledge, query, limite):
     try:
         if hasattr(knowledge, "search"):
-            docs = knowledge.search(query=pergunta, max_results=limite)
+            docs = knowledge.search(query=query, max_results=limite)
         elif hasattr(knowledge, "vector_db") and hasattr(knowledge.vector_db, "search"):
-            docs = knowledge.vector_db.search(query=pergunta, limit=limite)
+            docs = knowledge.vector_db.search(query=query, limit=limite)
         else:
-            docs = []
-
-        docs = docs or []
-        print(f"[DEBUG BUSCA] Encontrados: {len(docs)} documentos para '{pergunta}'")
-
-        if not docs:
-            return ""
-
-        trechos = []
-        for i, d in enumerate(docs, 1):
-            meta = getattr(d, "meta_data", None) or {}
-            fonte = meta.get("source_file", "Documento IFSC")
-            secao = meta.get("header_path", "")
-            conteudo = getattr(d, "content", "")
-            trechos.append(f"[Trecho {i} | Fonte: {fonte} | Seção: {secao}]\n{conteudo}")
-
-        return "\n\n---\n\n".join(trechos)
+            raise ErroBusca("O objeto de conhecimento não tem método de busca.")
+    except ErroBusca:
+        raise
     except Exception as e:
-        print(f"[DEBUG BUSCA] Erro na busca: {e}")
-        return ""
+        logger.exception("Erro na busca vetorial para %r", query)
+        raise ErroBusca(str(e)) from e
+    return docs or []
 
 
+def buscar_contexto(knowledge, queries, limite=5):
+    listas = [_buscar_docs(knowledge, q, limite) for q in queries]
+
+    vistos, docs = set(), []
+    for rodada in zip_longest(*listas):  # intercala resultados das queries
+        for d in rodada:
+            if d is None:
+                continue
+            chave = getattr(d, "content", "")
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            docs.append(d)
+            if len(docs) >= limite:
+                return docs
+    return docs
+
+
+def formatar_trechos(docs):
+    trechos = []
+    for i, d in enumerate(docs, 1):
+        meta = getattr(d, "meta_data", None) or {}
+        fonte = meta.get("source_file", "Documento IFSC")
+        secao = meta.get("header_path", "")
+        conteudo = getattr(d, "content", "")
+        trechos.append(f"[Trecho {i} | Fonte: {fonte} | Seção: {secao}]\n{conteudo}")
+    return "\n\n---\n\n".join(trechos)
+
+
+# ---------------------------------------------------------------------------
+# Agente / LLM
+# ---------------------------------------------------------------------------
 def criar_agente_com_modelo(model_id):
     from agno.agent import Agent
 
@@ -205,7 +331,8 @@ def criar_agente_com_modelo(model_id):
     data_hoje = datetime.now().strftime("%d/%m/%Y")
 
     return Agent(
-        model=Gemini(id=model_id),
+        # api_key explícita: funciona com GOOGLE_API_KEY ou GEMINI_API_KEY
+        model=Gemini(id=model_id, api_key=obter_api_key()),
         instructions=[
             f"Data atual: {data_hoje}. Use essa data como referência para calcular prazos, anos ou idade da instituição.",
             "Você é o OrientAI, assistente virtual dos estudantes do IFSC.",
@@ -228,29 +355,60 @@ def formatar_historico(mensagens, limite=10):
     return "\n".join(linhas)
 
 
+MARCADORES_ERRO = (
+    '"error":',
+    "'error':",
+    "RESOURCE_EXHAUSTED",
+    "UNAVAILABLE",
+    "invalid_request_error",
+    "Error from Gemini API",
+    "HTTP 429",
+    "HTTP 503",
+)
+
+
 def _parece_erro(texto):
+    """Rede de segurança: o normal é o agent.run lançar exceção.
+
+    Só olhamos marcadores em textos curtos, para não dar falso positivo
+    numa resposta longa e legítima.
+    """
     if not texto or not texto.strip():
         return True
-    marcadores = (
-        '"error":',
-        "'error':",
-        "RESOURCE_EXHAUSTED",
-        "UNAVAILABLE",
-        "invalid_request_error",
-        "Error from Gemini API",
-        "HTTP 429",
-        "HTTP 503",
-    )
-    return any(m in texto for m in marcadores)
+    return len(texto) <= 1500 and any(m in texto for m in MARCADORES_ERRO)
+
+
+def _eh_limite_de_cota(msg):
+    msg = (msg or "").lower()
+    return any(m in msg for m in ("429", "resource_exhausted", "quota"))
+
+
+MSG_ERRO_BUSCA = (
+    "Tive um problema técnico ao consultar a base de documentos 😕. "
+    "Tenta de novo daqui a pouco — se continuar, avisa quem mantém o OrientAI."
+)
+
+MSG_ERRO_LLM = (
+    "Os servidores do Gemini estão com instabilidade temporária ou atingiram o limite gratuito agora 😅. "
+    "Tenta novamente em alguns segundos!"
+)
 
 
 def responder_com_fallback(knowledge, historico_mensagens, pergunta_atual):
-    contexto_conversa = formatar_historico(historico_mensagens[:-1], limite=6)
-    trechos_docs = buscar_contexto(knowledge, pergunta_atual, limite=5)
+    # Tira a pergunta atual (última) e a mensagem de boas-vindas (ruído para o modelo)
+    anteriores = [m for m in historico_mensagens[:-1] if not m.get("welcome")]
+    contexto_conversa = formatar_historico(anteriores, limite=6) or "(início da conversa)"
+
+    try:
+        docs = buscar_contexto(knowledge, montar_queries_busca(anteriores, pergunta_atual), limite=5)
+    except ErroBusca:
+        return MSG_ERRO_BUSCA
+
+    trechos_docs = formatar_trechos(docs) if docs else "Nenhum trecho encontrado na base."
+    logger.info("Busca: %d trechos para %r", len(docs), pergunta_atual)
 
     prompt_completo = (
-        f"Trechos recuperados dos documentos oficiais do IFSC:\n"
-        f"{trechos_docs if trechos_docs else 'Nenhum trecho encontrado na base.'}\n\n"
+        f"Trechos recuperados dos documentos oficiais do IFSC:\n{trechos_docs}\n\n"
         f"Histórico recente desta conversa:\n{contexto_conversa}\n\n"
         f"Nova mensagem do estudante: {pergunta_atual}"
     )
@@ -258,37 +416,47 @@ def responder_com_fallback(knowledge, historico_mensagens, pergunta_atual):
     for model_id in GEMINI_MODELS:
         try:
             agent = criar_agente_com_modelo(model_id)
-        except Exception as e:
-            print(f"[Fallback] Falha ao instanciar agente para {model_id}: {e}")
+        except Exception:
+            logger.exception("Falha ao instanciar agente para %s", model_id)
             continue
 
-        for tentativa in range(2):
+        for tentativa in range(MAX_TENTATIVAS_POR_MODELO):
+            erro_msg = ""
             try:
                 resposta = agent.run(prompt_completo)
                 texto = resposta.content if resposta else ""
+                if texto is not None and not isinstance(texto, str):
+                    texto = str(texto)
+                texto = texto or ""
 
-                if _parece_erro(texto):
-                    print(f"[Fallback] {model_id} (tentativa {tentativa + 1}) retornou erro. Aguardando...")
-                    time.sleep(2)
-                    continue
+                if not _parece_erro(texto):
+                    return texto
 
-                return texto
+                erro_msg = texto
+                logger.warning("%s (tentativa %d) retornou texto de erro: %.200s", model_id, tentativa + 1, texto)
             except Exception as e:
-                print(f"[Fallback] {model_id} (tentativa {tentativa + 1}) falhou: {e}")
-                time.sleep(2)
+                erro_msg = str(e)
+                logger.warning("%s (tentativa %d) falhou: %s", model_id, tentativa + 1, e)
 
-    return (
-        "Os servidores do Gemini estão com instabilidade temporária ou atingiram o limite gratuito agora 😅. "
-        "Tenta novamente em alguns segundos!"
-    )
+            # Estourou cota: repetir no mesmo modelo não adianta, vai pro próximo
+            if _eh_limite_de_cota(erro_msg):
+                break
+            # Só espera se ainda houver outra tentativa neste modelo
+            if tentativa < MAX_TENTATIVAS_POR_MODELO - 1:
+                time.sleep(1.5 * (tentativa + 1))
+
+    return MSG_ERRO_LLM
 
 
+# ---------------------------------------------------------------------------
+# Interface
+# ---------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="OrientAI", page_icon="🎓", layout="centered")
     st.title("🎓 OrientAI")
     st.caption("Assistente baseado nos documentos institucionais do IFSC")
 
-    if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+    if not obter_api_key():
         st.error('Defina sua chave no terminal antes de rodar: `$env:GOOGLE_API_KEY="sua-chave-aqui"`')
         st.stop()
 
@@ -299,11 +467,14 @@ def main():
     try:
         knowledge = montar_base_conhecimento(CHUNKS_FILE)
     except Exception as e:
+        logger.exception("Erro ao preparar a base de conhecimento")
         st.error(f"Erro ao preparar a base de conhecimento: {e}")
         st.stop()
 
     if "mensagens" not in st.session_state:
-        st.session_state.mensagens = [{"role": "assistant", "content": MENSAGEM_BOAS_VINDAS}]
+        st.session_state.mensagens = [
+            {"role": "assistant", "content": MENSAGEM_BOAS_VINDAS, "welcome": True}
+        ]
 
     for msg in st.session_state.mensagens:
         with st.chat_message(msg["role"]):
