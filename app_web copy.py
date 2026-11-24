@@ -208,6 +208,17 @@ def inserir_documentos(vector_db, documentos, content_hash):
         logger.info("Indexados %d/%d chunks", min(i + TAMANHO_LOTE_INDEXACAO, len(documentos)), len(documentos))
 
 
+def contar_documentos(vector_db):
+    """Quantos chunks há na coleção (None se não der para saber)."""
+    try:
+        if hasattr(vector_db, "get_count"):
+            return int(vector_db.get_count())
+        return int(vector_db._collection.count())
+    except Exception:
+        logger.exception("Não foi possível contar os documentos da coleção")
+        return None
+
+
 def ler_hash_salvo():
     if not os.path.exists(HASH_FILE):
         return None
@@ -240,14 +251,30 @@ def montar_base_conhecimento(chunks_path=CHUNKS_FILE):
         )
         knowledge = Knowledge(vector_db=vector_db)
 
+        total = contar_documentos(vector_db)
+
+        # Hash igual mas coleção vazia = indexação anterior falhou em silêncio
+        if not precisa_indexar and total == 0:
+            logger.warning("Hash igual, mas a coleção está vazia; reindexando.")
+            precisa_indexar = True
+
         if precisa_indexar:
             documentos = construir_documentos(chunks_dados, Document)
             if not documentos:
                 raise ValueError(f"Nenhum chunk válido encontrado em '{chunks_path}'.")
             inserir_documentos(vector_db, documentos, hash_atual)
-            # Só grava o hash depois de indexar com sucesso
+
+            total = contar_documentos(vector_db)
+            if total == 0:
+                raise RuntimeError(
+                    "A indexação terminou, mas a coleção continua vazia. "
+                    "Verifique a versão do Agno/ChromaDb."
+                )
+            # Só grava o hash depois de confirmar que indexou de verdade
             with open(HASH_FILE, "w", encoding="utf-8") as f:
                 f.write(hash_atual)
+
+        logger.info("Base pronta: %s chunks na coleção '%s'", total, COLLECTION_NAME)
 
     return knowledge
 
@@ -335,21 +362,28 @@ def criar_agente_com_modelo(model_id):
         model=Gemini(id=model_id, api_key=obter_api_key()),
         instructions=[
             f"Data atual: {data_hoje}. Use essa data como referência para calcular prazos, anos ou idade da instituição.",
-            "Você é o OrientAI, assistente virtual dos estudantes do IFSC.",
+            "Você é o OrientAI, assistente virtual dos estudantes do IFSC. Seu nome é OrientAI; se perguntarem quem você é, seu nome ou como você está, responda normalmente em uma ou duas frases simpáticas.",
             "Tom: amigável, acolhedor e direto — como um veterano ajudando um calouro, sem ser formal demais.",
             "REGRA DE SAUDAÇÃO: Você JÁ se apresentou na mensagem inicial do chat. NUNCA diga 'Oi, eu sou o OrientAI' ou se apresente novamente. Vá direto ao ponto da resposta.",
-            "FOCO E ESCOPO: Baseie suas respostas EXCLUSIVAMENTE nos trechos de documentos fornecidos no prompt. Se perguntarem algo pessoal ou fora dos documentos, responda em 1 frase curta e amigável que seu foco é ajudar com as regras e documentos do IFSC, sem inventar funções que não tem.",
-            "Se a informação não estiver nos trechos fornecidos, diga isso claramente de forma simpática, sem inventar.",
-            "Quando encontrar a resposta nos trechos, cite o documento, capítulo ou artigo correspondente.",
+            "DOIS TIPOS DE PERGUNTA. (1) Sobre o IFSC (regras, direitos, deveres, medidas disciplinares, bolsas, cursos, procedimentos, sistemas): baseie-se EXCLUSIVAMENTE nos trechos de documentos fornecidos no prompt, cite documento, capítulo ou artigo, e NUNCA complete lacunas com conhecimento geral ou suposições sobre regras da instituição. (2) Conhecimento geral, matemática, curiosidades ou conversa casual: responda normalmente com o seu próprio conhecimento, de forma curta e simpática, e IGNORE os trechos do prompt se não tiverem relação com a pergunta (eles são buscados automaticamente e podem ser irrelevantes).",
+            "Se a pergunta for sobre o IFSC e a informação não estiver nos trechos fornecidos, diga isso claramente de forma simpática, sem inventar, e sugira a secretaria ou a Coordenadoria de Assuntos Estudantis do câmpus, ou o site oficial.",
+            "Se os trechos parecerem de um documento possivelmente desatualizado (listas de câmpus, contatos, prazos, valores), avise que vale conferir a versão mais recente.",
+            "Não termine toda resposta com frases como 'é só chamar' nem repita que seu foco é o IFSC; só ofereça ajuda extra quando fizer sentido.",
             "Use o histórico da conversa fornecido para manter o contexto e responder perguntas sobre mensagens anteriores.",
         ],
     )
 
 
-def formatar_historico(mensagens, limite=10):
-    recentes = mensagens[-limite:]
+def formatar_historico(mensagens, max_perguntas=20, max_respostas=3):
+    """Perguntas do estudante são curtas: mantém muitas. Respostas do bot são longas: só as últimas."""
+    idx_perguntas = [i for i, m in enumerate(mensagens) if m["role"] == "user"][-max_perguntas:]
+    idx_respostas = [i for i, m in enumerate(mensagens) if m["role"] != "user"][-max_respostas:]
+    manter = set(idx_perguntas) | set(idx_respostas)
+
     linhas = []
-    for m in recentes:
+    for i, m in enumerate(mensagens):
+        if i not in manter:
+            continue
         papel = "Estudante" if m["role"] == "user" else "OrientAI"
         linhas.append(f"{papel}: {m['content']}")
     return "\n".join(linhas)
@@ -397,7 +431,7 @@ MSG_ERRO_LLM = (
 def responder_com_fallback(knowledge, historico_mensagens, pergunta_atual):
     # Tira a pergunta atual (última) e a mensagem de boas-vindas (ruído para o modelo)
     anteriores = [m for m in historico_mensagens[:-1] if not m.get("welcome")]
-    contexto_conversa = formatar_historico(anteriores, limite=6) or "(início da conversa)"
+    contexto_conversa = formatar_historico(anteriores) or "(início da conversa)"
 
     try:
         docs = buscar_contexto(knowledge, montar_queries_busca(anteriores, pergunta_atual), limite=5)
@@ -406,9 +440,12 @@ def responder_com_fallback(knowledge, historico_mensagens, pergunta_atual):
 
     trechos_docs = formatar_trechos(docs) if docs else "Nenhum trecho encontrado na base."
     logger.info("Busca: %d trechos para %r", len(docs), pergunta_atual)
+    for i, d in enumerate(docs, 1):
+        meta = getattr(d, "meta_data", None) or {}
+        logger.info("  trecho %d: %s | %s", i, meta.get("source_file"), meta.get("header_path"))
 
     prompt_completo = (
-        f"Trechos recuperados dos documentos oficiais do IFSC:\n{trechos_docs}\n\n"
+        f"Trechos recuperados dos documentos oficiais do IFSC (podem não ter relação com a pergunta):\n{trechos_docs}\n\n"
         f"Histórico recente desta conversa:\n{contexto_conversa}\n\n"
         f"Nova mensagem do estudante: {pergunta_atual}"
     )
